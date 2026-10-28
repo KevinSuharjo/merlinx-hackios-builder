@@ -13,7 +13,7 @@ on:
           - firmware_and_xnu
 
 jobs:
-  # JOB 1: Build UEFI Mu-Silicium + p33 Boot Image
+  # JOB 1: Build UEFI Mu-Silicium + Pack p33 Boot Image
   build-uefi:
     runs-on: ubuntu-24.04
     steps:
@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install -y \
             build-essential clang lld llvm gcc-aarch64-linux-gnu \
             nasm iasl git curl wget uuid-dev bc device-tree-compiler \
-            abootimg mkbootimg libfdt-dev
+            abootimg mkbootimg libfdt-dev gzip
 
       - name: Clone UniXNU-merlinx & uefi-merlinx
         run: |
@@ -54,12 +54,67 @@ jobs:
         working-directory: ./UniXNU-merlinx
         run: |
           chmod +x ./unixnu
+          
+          # 1. Tampilkan daftar sub-command unixnu di log biar jelas
+          echo "=== DAFTAR COMMAND UNIXNU ==="
+          python ./unixnu --help || true
+          python ./unixnu build --help || true
+          
+          # 2. Build SILICIUM_UEFI.fd
           python ./unixnu build firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
+          
+          # 3. Coba pack boot.img lewat command bawaan unixnu
+          echo "=== PACKING BOOT.IMG (p33) ==="
+          python ./unixnu build bootimg -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore || \
+          python ./unixnu bootimg -D . --uefi ../uefi-merlinx || \
+          python ./unixnu package -D . --uefi ../uefi-merlinx || true
+
+          # 4. Fallback: Kalau unixnu butuh argumen khusus, kita cek isi bootimg.py & pack otomatis
+          if ! find . ../uefi-merlinx -name "*.img" | grep -q .; then
+            echo "=== MENJALANKAN FALLBACK PACKER DARI BOOTIMG.PY ==="
+            cat scripts/unixnu/cli.py || true
+            cat scripts/unixnu/bootimg.py || true
+            
+            # Cari file UEFI fd, BootShim, dan DTB untuk di-pack manual kalau belum jadi .img
+            FD_FILE=$(find ../uefi-merlinx/Build -name "SILICIUM_UEFI.fd" | head -n 1)
+            DTB_FILE=$(find . ../uefi-merlinx -name "*merlin*.dtb" -o -name "*.dtb" | head -n 1)
+            
+            if [ -n "$FD_FILE" ]; then
+              # Compile BootShim kalau ada di uefi-merlinx
+              if [ -d "../uefi-merlinx/BootShim" ]; then
+                make -C ../uefi-merlinx/BootShim UEFI_BASE=0x40080000 UEFI_SIZE=0x00300000 || true
+              fi
+              SHIM_FILE=$(find . ../uefi-merlinx -name "BootShim.bin" | head -n 1)
+              
+              if [ -n "$SHIM_FILE" ]; then
+                cat "$SHIM_FILE" "$FD_FILE" > uefi_payload.bin
+              else
+                cp "$FD_FILE" uefi_payload.bin
+              fi
+              gzip -c -9 uefi_payload.bin > uefi_payload.bin.gz
+              
+              if [ -n "$DTB_FILE" ]; then
+                cat uefi_payload.bin.gz "$DTB_FILE" > kernel_dtb
+              else
+                cp uefi_payload.bin.gz kernel_dtb
+              fi
+              
+              mkbootimg \
+                --kernel kernel_dtb \
+                --base 0x40078000 \
+                --kernel_offset 0x00008000 \
+                --ramdisk_offset 0x07c08000 \
+                --tags_offset 0x0bc08000 \
+                --pagesize 2048 \
+                --cmdline "bootopt=64S3,32N2,64N2" \
+                -o merlinx_uefi_boot.img || true
+            fi
+          fi
 
       - name: Kumpulkan Hasil Build (.img & .fd)
         run: |
           mkdir -p output_artifacts
-          find UniXNU-merlinx/ -name "*.img" -exec cp {} output_artifacts/ \;
+          find UniXNU-merlinx/ -maxdepth 3 -name "*.img" -exec cp {} output_artifacts/ \;
           find uefi-merlinx/Build/ -name "*.fd" -exec cp {} output_artifacts/ \;
           ls -lh output_artifacts/
 
