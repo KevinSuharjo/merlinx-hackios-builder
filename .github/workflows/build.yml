@@ -11,10 +11,12 @@ on:
         options:
           - firmware_only
           - firmware_and_xnu
+          - xnu_only
 
 jobs:
   # JOB 1: Build UEFI Mu-Silicium + Pack p33 Boot Image
   build-uefi:
+    if: ${{ github.event.inputs.build_target != 'xnu_only' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository (Untuk mengambil file dtb lokal)
@@ -122,7 +124,7 @@ jobs:
 
   # JOB 2: (Opsional) Build HackiOS XNU Kernel di macOS ARM64 Runner
   build-xnu:
-    if: ${{ github.event.inputs.build_target == 'firmware_and_xnu' }}
+    if: ${{ github.event.inputs.build_target != 'firmware_only' }}
     runs-on: macos-14
     steps:
       - name: Clone HackiOS XNU Kernel
@@ -146,6 +148,12 @@ jobs:
       - name: Install build tools (best effort)
         run: |
           brew install cmake ninja pkg-config || true
+
+      - name: Shim nproc (macOS tidak punya nproc)
+        run: |
+          printf '#!/bin/sh\nsysctl -n hw.ncpu\n' | sudo tee /usr/local/bin/nproc >/dev/null
+          sudo chmod +x /usr/local/bin/nproc
+          nproc
 
       - name: Build XNU Kernel
         working-directory: ./hackios-xnu-kernel
