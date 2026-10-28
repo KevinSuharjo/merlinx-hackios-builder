@@ -1,0 +1,92 @@
+name: Build UniXNU & HackiOS Merlinx
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Pilih target build'
+        required: true
+        default: 'firmware_only'
+        type: choice
+        options:
+          - firmware_only
+          - firmware_and_xnu
+
+jobs:
+  # JOB 1: Build UEFI Mu-Silicium + p33 Boot Image (di Ubuntu)
+  build-uefi:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang lld llvm gcc-aarch64-linux-gnu \
+            nasm iasl python3 python3-pip python3-venv \
+            git curl wget uuid-dev bc device-tree-compiler \
+            abootimg android-tools-mkbootimg
+
+      - name: Clone UniXNU-merlinx & uefi-merlinx
+        run: |
+          git clone --recurse-submodules https://github.com/Dracen-W/UniXNU-merlinx.git
+          git clone --recurse-submodules https://github.com/Dracen-W/uefi-merlinx.git
+
+      - name: Setup EDK2 Python Tools (Stuart)
+        working-directory: ./uefi-merlinx
+        run: |
+          python3 -m pip install --upgrade pip
+          if [ -f "pip-requirements.txt" ]; then
+            pip3 install -r pip-requirements.txt
+          else
+            pip3 install edk2-pytool-library edk2-pytool-extensions
+          fi
+          stuart_setup -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
+          stuart_update -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
+
+      - name: Build UEFI & Pack p33 Boot Image
+        working-directory: ./UniXNU-merlinx
+        run: |
+          chmod +x ./unixnu
+          ./unixnu build firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
+
+      - name: Kumpulkan Hasil Build (.img & .fd)
+        run: |
+          mkdir -p output_artifacts
+          find UniXNU-merlinx/ -name "*.img" -exec cp {} output_artifacts/ \;
+          find uefi-merlinx/Build/ -name "*.fd" -exec cp {} output_artifacts/ \;
+          ls -lh output_artifacts/
+
+      - name: Upload Boot Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merlinx-uefi-bootimg
+          path: output_artifacts/*
+
+  # JOB 2: (Opsional) Build HackiOS XNU Kernel di macOS ARM64 Runner
+  build-xnu:
+    if: ${{ github.event.inputs.build_target == 'firmware_and_xnu' }}
+    runs-on: macos-14
+    steps:
+      - name: Clone HackiOS XNU Kernel
+        run: |
+          git clone --recurse-submodules https://github.com/oosexgang/hackios-xnu-kernel.git
+
+      - name: Inspect & Build XNU Kernel
+        working-directory: ./hackios-xnu-kernel
+        run: |
+          # Cek script build bawaan repo hackios-xnu-kernel
+          if [ -f "build.sh" ]; then
+            chmod +x build.sh
+            ./build.sh
+          else
+            make SDKROOT=iphoneos ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT -j$(sysctl -n hw.ncpu)
+          fi
+
+      - name: Upload XNU Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hackios-xnu-kernel-bin
+          path: |
+            hackios-xnu-kernel/BUILD/obj/**/kernel*
+            hackios-xnu-kernel/build/**
+          if-no-files-found: warn
