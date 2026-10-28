@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y \
             build-essential clang lld llvm gcc-aarch64-linux-gnu \
             nasm iasl git curl wget uuid-dev bc device-tree-compiler \
-            abootimg libfdt-dev gzip
+            abootimg libfdt-dev gzip cpio
 
       - name: Clone UniXNU-merlinx & uefi-merlinx
         run: |
@@ -73,23 +73,43 @@ jobs:
 
           echo "Found Raw DTB: $RAW_DTB"
 
-          # 3. Ekstrak & Bersihkan FDT murni (1 baris Python tanpa masalah indentasi YAML)
+          # 3. Ekstrak FDT murni TANPA di-recompile dtc (agar node /__symbols__ untuk DTBO overlay tidak rusak!)
           python3 -c "import sys, struct; d = open(sys.argv[1], 'rb').read(); i = d.index(b'\xd0\x0d\xfe\xed'); s = struct.unpack_from('>I', d, i+4)[0]; print(f'FDT offset: {i}, size: {s}'); open(sys.argv[2], 'wb').write(d[i:i+s])" "$RAW_DTB" "$PWD/clean_merlinx.dtb"
+          DTB_PATH="$PWD/clean_merlinx.dtb"
 
-          # Normalisasi ulang lewat dtc (kalau gagal pakai hasil potong langsung)
-          dtc -I dtb -O dtb -o "$PWD/merlinx_final.dtb" "$PWD/clean_merlinx.dtb" || cp "$PWD/clean_merlinx.dtb" "$PWD/merlinx_final.dtb"
-          DTB_PATH="$PWD/merlinx_final.dtb"
-          echo "Using Cleaned Stock DTB: $DTB_PATH"
+          # 4. Buat Dummy Ramdisk (cpio.gz) agar bootloader MediaTek (lk) tidak menolak ramdisk 0 byte
+          mkdir -p dummy_rd
+          echo "merlinx" > dummy_rd/init
+          (cd dummy_rd && find . | cpio -o -H newc | gzip -9 > "$PWD/../dummy_ramdisk.cpio.gz")
 
-          # 4. Pack menjadi boot.img resmi lewat unixnu bootimg!
-          python ./unixnu bootimg -D . --uefi ../uefi-merlinx --dtb "$DTB_PATH" -o "$PWD/boot.img"
+          # 5. Jalankan unixnu bootimg standar dulu dengan dummy ramdisk
+          python ./unixnu bootimg -D . --uefi ../uefi-merlinx --dtb "$DTB_PATH" --ramdisk "$PWD/dummy_ramdisk.cpio.gz" -o "$PWD/boot_raw.img"
+
+          # 6. Inject os_version=12.0.0, os_patch_level=2022-09, dan cmdline asli MT6768 ke dalam boot.img!
+          python3 - "$PWD/boot_raw.img" "$PWD/boot.img" << 'EOF'
+          import sys, struct
+          raw_img, out_img = sys.argv[1], sys.argv[2]
+          data = bytearray(open(raw_img, 'rb').read())
+          
+          # Hitung os_version (12.0.0) & os_patch_level (2022-09) sesuai standar Android Boot Image Header
+          # os_version: (A << 14) | (B << 7) | C -> (12 << 14) = 196608
+          # os_patch_level: ((Y - 2000) << 4) | M -> ((22) << 4) | 9 = 361
+          os_ver_patch = (196608 << 11) | 361
+          struct.pack_into('<I', data, 44, os_ver_patch)
+          
+          # Set cmdline asli merlinx: "bootopt=64S3,32N2,64N2 buildvariant=user" (offset 64, max 512 bytes)
+          cmdline = b"bootopt=64S3,32N2,64N2 buildvariant=user"
+          data[64:64+512] = cmdline.ljust(512, b'\x00')
+          
+          open(out_img, 'wb').write(data)
+          print("Successfully patched boot.img with os_version=12.0.0, os_patch_level=2022-09, and MTK 64-bit cmdline!")
+          EOF
 
       - name: Kumpulkan Hasil Build (boot.img, boot.json, & SILICIUM_UEFI.fd)
         run: |
           mkdir -p output_artifacts
           cp UniXNU-merlinx/boot.img output_artifacts/ 2>/dev/null || true
           cp UniXNU-merlinx/boot.json output_artifacts/ 2>/dev/null || true
-          find UniXNU-merlinx/out/ -name "boot.img" -exec cp {} output_artifacts/ \;
           find uefi-merlinx/Build/ -name "SILICIUM_UEFI.fd" -exec cp {} output_artifacts/ \;
           ls -lh output_artifacts/
           cat output_artifacts/boot.json || true
