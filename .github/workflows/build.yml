@@ -129,21 +129,54 @@ jobs:
         run: |
           git clone --recurse-submodules https://github.com/oosexgang/hackios-xnu-kernel.git
 
-      - name: Inspect & Build XNU Kernel
+      - name: Inspect repo, README & toolchain
         working-directory: ./hackios-xnu-kernel
         run: |
+          echo "=== ls ==="
+          ls -la
+          echo "=== README ==="
+          head -n 100 README* 2>/dev/null || echo "(tidak ada README)"
+          echo "=== Xcode & SDK ==="
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          xcrun --sdk macosx --show-sdk-path || true
+          echo "=== Tools ==="
+          which dtrace ctfconvert ctfmerge ctfdump || true
+
+      - name: Install build tools (best effort)
+        run: |
+          brew install cmake ninja pkg-config || true
+
+      - name: Build XNU Kernel
+        working-directory: ./hackios-xnu-kernel
+        continue-on-error: true
+        run: |
+          set -o pipefail
           if [ -f "build.sh" ]; then
             chmod +x build.sh
-            ./build.sh
+            ./build.sh 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
           else
-            make SDKROOT=iphoneos ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT -j$(sysctl -n hw.ncpu)
+            make SDKROOT=iphoneos ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT -j$(sysctl -n hw.ncpu) 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
           fi
 
-      - name: Upload XNU Kernel Artifact
+      - name: Cari hasil kernel
+        if: always()
+        run: |
+          find hackios-xnu-kernel -type f \
+            \( -name "kernel*" -o -name "*.kc" -o -name "kernelcache*" -o -name "*.kext" \) \
+            -not -path "*/.git/*" -not -name "*.c" -not -name "*.h" -not -name "*.s" \
+            | tee xnu-found.txt || true
+          echo "=== 50 baris terakhir log ==="
+          tail -n 50 xnu-build.log 2>/dev/null || true
+
+      - name: Upload XNU Kernel Artifact & Log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hackios-xnu-kernel-bin
           path: |
-            hackios-xnu-kernel/BUILD/obj/**/kernel*
+            xnu-build.log
+            xnu-found.txt
+            hackios-xnu-kernel/BUILD/**
             hackios-xnu-kernel/build/**
           if-no-files-found: warn
