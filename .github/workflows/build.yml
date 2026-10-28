@@ -155,6 +155,18 @@ jobs:
           sudo chmod +x /usr/local/bin/nproc
           nproc
 
+      - name: Setup xnu-deps (apply patch + setup.sh dipanggil manual)
+        working-directory: ./hackios-xnu-kernel
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # make kernel nge-skip setup.sh karena xnu-deps/host/bin/xnu-clang sudah ada di repo,
+          # jadi kita panggil sendiri: stage1 (sumber, host tools, SDK) lalu stage2 (library)
+          brew install autoconf automake || true
+          [ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh
+          chmod +x xnu-deps/setup.sh
+          JOBS=$(sysctl -n hw.ncpu) xnu-deps/setup.sh 2>&1 | tee "$GITHUB_WORKSPACE/xnu-setup.log"
+
       - name: Build XNU Kernel
         working-directory: ./hackios-xnu-kernel
         continue-on-error: true
@@ -194,6 +206,8 @@ jobs:
           name: hackios-xnu-kernel-bin
           path: |
             xnu-build.log
+            xnu-setup.log
+            hackios-xnu-kernel/xnu-deps/*.log
             xnu-diagnosa.log
             xnu-found.txt
             hackios-xnu-kernel/xnu-src/BUILD/obj/**/kernel*
