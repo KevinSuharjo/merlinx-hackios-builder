@@ -17,7 +17,7 @@ jobs:
   build-uefi:
     runs-on: ubuntu-24.04
     steps:
-      - name: Set up Python 3.12 (Fix tomllib error)
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install -y \
             build-essential clang lld llvm gcc-aarch64-linux-gnu \
             nasm iasl git curl wget uuid-dev bc device-tree-compiler \
-            abootimg mkbootimg libfdt-dev gzip
+            abootimg libfdt-dev gzip
 
       - name: Clone UniXNU-merlinx & uefi-merlinx
         run: |
@@ -50,73 +50,56 @@ jobs:
           stuart_setup -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
           stuart_update -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
 
-      - name: Build UEFI & Pack p33 Boot Image
+      - name: Build UEFI & Pack p33 Boot Image (boot.img)
         working-directory: ./UniXNU-merlinx
         run: |
           chmod +x ./unixnu
-          
-          # 1. Tampilkan daftar sub-command unixnu di log biar jelas
-          echo "=== DAFTAR COMMAND UNIXNU ==="
-          python ./unixnu --help || true
-          python ./unixnu build --help || true
-          
-          # 2. Build SILICIUM_UEFI.fd
-          python ./unixnu build firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
-          
-          # 3. Coba pack boot.img lewat command bawaan unixnu
-          echo "=== PACKING BOOT.IMG (p33) ==="
-          python ./unixnu build bootimg -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore || \
-          python ./unixnu bootimg -D . --uefi ../uefi-merlinx || \
-          python ./unixnu package -D . --uefi ../uefi-merlinx || true
 
-          # 4. Fallback: Kalau unixnu butuh argumen khusus, kita cek isi bootimg.py & pack otomatis
-          if ! find . ../uefi-merlinx -name "*.img" | grep -q .; then
-            echo "=== MENJALANKAN FALLBACK PACKER DARI BOOTIMG.PY ==="
-            cat scripts/unixnu/cli.py || true
-            cat scripts/unixnu/bootimg.py || true
-            
-            # Cari file UEFI fd, BootShim, dan DTB untuk di-pack manual kalau belum jadi .img
-            FD_FILE=$(find ../uefi-merlinx/Build -name "SILICIUM_UEFI.fd" | head -n 1)
-            DTB_FILE=$(find . ../uefi-merlinx -name "*merlin*.dtb" -o -name "*.dtb" | head -n 1)
-            
-            if [ -n "$FD_FILE" ]; then
-              # Compile BootShim kalau ada di uefi-merlinx
-              if [ -d "../uefi-merlinx/BootShim" ]; then
-                make -C ../uefi-merlinx/BootShim UEFI_BASE=0x40080000 UEFI_SIZE=0x00300000 || true
-              fi
-              SHIM_FILE=$(find . ../uefi-merlinx -name "BootShim.bin" | head -n 1)
-              
-              if [ -n "$SHIM_FILE" ]; then
-                cat "$SHIM_FILE" "$FD_FILE" > uefi_payload.bin
-              else
-                cp "$FD_FILE" uefi_payload.bin
-              fi
-              gzip -c -9 uefi_payload.bin > uefi_payload.bin.gz
-              
-              if [ -n "$DTB_FILE" ]; then
-                cat uefi_payload.bin.gz "$DTB_FILE" > kernel_dtb
-              else
-                cp uefi_payload.bin.gz kernel_dtb
-              fi
-              
-              mkbootimg \
-                --kernel kernel_dtb \
-                --base 0x40078000 \
-                --kernel_offset 0x00008000 \
-                --ramdisk_offset 0x07c08000 \
-                --tags_offset 0x0bc08000 \
-                --pagesize 2048 \
-                --cmdline "bootopt=64S3,32N2,64N2" \
-                -o merlinx_uefi_boot.img || true
+          # 1. Build Package (UniXNU.efi & DarwinBoot) + Firmware (SILICIUM_UEFI.fd)
+          python ./unixnu build package firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
+
+          # 2. Cari atau buat Device Tree (.dtb) untuk merlinx
+          DTB_PATH=$(find . ../uefi-merlinx -name "*.dtb" | head -n 1)
+          if [ -z "$DTB_PATH" ]; then
+            DTS_PATH=$(find . ../uefi-merlinx -name "*merlin*.dts" | head -n 1)
+            if [ -n "$DTS_PATH" ]; then
+              echo "Compiling DTS found at $DTS_PATH..."
+              dtc -I dts -O dtb -o merlinx.dtb "$DTS_PATH"
+              DTB_PATH="$PWD/merlinx.dtb"
+            else
+              echo "Generating base MT6768 (merlin) DTB for Little Kernel bootloader..."
+              cat << 'EOF' > merlinx.dts
+          /dts-v1/;
+          / {
+              model = "MT6768";
+              compatible = "mediatek,mt6768";
+              #address-cells = <2>;
+              #size-cells = <2>;
+              chosen { };
+              memory@40000000 {
+                  device_type = "memory";
+                  reg = <0x0 0x40000000 0x0 0x80000000>;
+              };
+          };
+          EOF
+              dtc -I dts -O dtb -o merlinx.dtb merlinx.dts
+              DTB_PATH="$PWD/merlinx.dtb"
             fi
           fi
+          echo "Using DTB: $DTB_PATH"
 
-      - name: Kumpulkan Hasil Build (.img & .fd)
+          # 3. Pack menjadi boot.img resmi lewat unixnu bootimg!
+          python ./unixnu bootimg -D . --uefi ../uefi-merlinx --dtb "$DTB_PATH" -o "$PWD/boot.img"
+
+      - name: Kumpulkan Hasil Build (boot.img, boot.json, & SILICIUM_UEFI.fd)
         run: |
           mkdir -p output_artifacts
-          find UniXNU-merlinx/ -maxdepth 3 -name "*.img" -exec cp {} output_artifacts/ \;
-          find uefi-merlinx/Build/ -name "*.fd" -exec cp {} output_artifacts/ \;
+          cp UniXNU-merlinx/boot.img output_artifacts/ 2>/dev/null || true
+          cp UniXNU-merlinx/boot.json output_artifacts/ 2>/dev/null || true
+          find UniXNU-merlinx/out/ -name "boot.img" -exec cp {} output_artifacts/ \;
+          find uefi-merlinx/Build/ -name "SILICIUM_UEFI.fd" -exec cp {} output_artifacts/ \;
           ls -lh output_artifacts/
+          cat output_artifacts/boot.json || true
 
       - name: Upload Boot Image Artifact
         uses: actions/upload-artifact@v4
