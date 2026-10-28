@@ -61,19 +61,41 @@ jobs:
           # 1. Build Package (UniXNU.efi & DarwinBoot) + Firmware (SILICIUM_UEFI.fd)
           python ./unixnu build package firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
 
-          # 2. Ambil DTB dari repo merlinx-hackios-builder (root directory atau subfolder dtb/)
+          # 2. Cari file DTB mentah dari repo merlinx-hackios-builder
           if [ -f "$GITHUB_WORKSPACE/dtb" ]; then
-            DTB_PATH="$GITHUB_WORKSPACE/dtb"
+            RAW_DTB="$GITHUB_WORKSPACE/dtb"
           elif [ -d "$GITHUB_WORKSPACE/dtb" ]; then
-            DTB_PATH=$(find "$GITHUB_WORKSPACE/dtb" -type f | head -n 1)
+            RAW_DTB=$(find "$GITHUB_WORKSPACE/dtb" -type f | head -n 1)
           else
             echo "Error: File atau folder 'dtb' tidak ditemukan di repository!"
             exit 1
           fi
 
-          echo "Using Stock DTB: $DTB_PATH"
+          echo "Found Raw DTB: $RAW_DTB"
 
-          # 3. Pack menjadi boot.img resmi lewat unixnu bootimg!
+          # 3. Ekstrak & Bersihkan FDT murni (hapus MTK header / concatenated DTB / padding)
+          cat << 'EOF' > fix_dtb.py
+          import sys, struct
+          raw_path, out_path = sys.argv[1], sys.argv[2]
+          data = open(raw_path, 'rb').read()
+          magic = b'\xd0\x0d\xfe\xed'
+          idx = data.find(magic)
+          if idx == -1:
+              sys.exit(f"Error: Magic FDT (d00dfeed) tidak ditemukan di {raw_path}! Pastikan file tidak corrupt.")
+          total_size = struct.unpack_from('>I', data, idx + 4)[0]
+          print(f"FDT ditemukan pada offset {idx}, ukuran murni: {total_size} bytes (ukuran file asli: {len(data)} bytes)")
+          fdt = data[idx : idx + total_size]
+          open(out_path, 'wb').write(fdt)
+          EOF
+          sed -i 's/^[ \t]*//' fix_dtb.py
+          python3 fix_dtb.py "$RAW_DTB" "$PWD/clean_merlinx.dtb"
+
+          # Normalisasi ulang lewat dtc (kalau gagal pakai hasil potong langsung)
+          dtc -I dtb -O dtb -o "$PWD/merlinx_final.dtb" "$PWD/clean_merlinx.dtb" || cp "$PWD/clean_merlinx.dtb" "$PWD/merlinx_final.dtb"
+          DTB_PATH="$PWD/merlinx_final.dtb"
+          echo "Using Cleaned Stock DTB: $DTB_PATH"
+
+          # 4. Pack menjadi boot.img resmi lewat unixnu bootimg!
           python ./unixnu bootimg -D . --uefi ../uefi-merlinx --dtb "$DTB_PATH" -o "$PWD/boot.img"
 
       - name: Kumpulkan Hasil Build (boot.img, boot.json, & SILICIUM_UEFI.fd)
