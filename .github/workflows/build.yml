@@ -1,188 +1,508 @@
-name: Build UniXNU & HackiOS Merlinx
-
-on:
-  workflow_dispatch:
-    inputs:
-      build_target:
-        description: 'Pilih target build'
-        required: true
-        default: 'firmware_only'
-        type: choice
-        options:
-          - firmware_only
-          - firmware_and_xnu
-          - xnu_only
-
-jobs:
-  # JOB 1: Build UEFI Mu-Silicium + Pack p33 Boot Image
-  build-uefi:
-    if: ${{ github.event.inputs.build_target != 'xnu_only' }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout Repository (Untuk mengambil file dtb lokal)
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang lld llvm gcc-aarch64-linux-gnu \
-            nasm iasl git curl wget uuid-dev bc device-tree-compiler \
-            abootimg libfdt-dev gzip cpio
-
-      - name: Clone UniXNU-merlinx & uefi-merlinx
-        run: |
-          git clone --recurse-submodules https://github.com/Dracen-W/UniXNU-merlinx.git
-          git clone --recurse-submodules https://github.com/Dracen-W/uefi-merlinx.git
-
-      - name: Setup EDK2 Python Tools (Stuart) & UniXNU Deps
-        working-directory: ./uefi-merlinx
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f "pip-requirements.txt" ]; then
-            pip install -r pip-requirements.txt
-          else
-            pip install edk2-pytool-library edk2-pytool-extensions
-          fi
-          if [ -f "../UniXNU-merlinx/requirements.txt" ]; then
-            pip install -r ../UniXNU-merlinx/requirements.txt
-          fi
-          stuart_setup -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
-          stuart_update -c Platforms/Xiaomi/merlinxPkg/PlatformBuild.py || true
-
-      - name: Build UEFI & Pack p33 Boot Image (boot.img)
-        working-directory: ./UniXNU-merlinx
-        run: |
-          chmod +x ./unixnu
-
-          # 1. Build Package (UniXNU.efi & DarwinBoot) + Firmware (SILICIUM_UEFI.fd)
-          python ./unixnu build package firmware -D . --uefi ../uefi-merlinx --edk2 ../uefi-merlinx/Mu_Basecore
-
-          # 2. Cari file DTB mentah dari repo merlinx-hackios-builder
-          if [ -f "$GITHUB_WORKSPACE/dtb" ]; then
-            RAW_DTB="$GITHUB_WORKSPACE/dtb"
-          elif [ -d "$GITHUB_WORKSPACE/dtb" ]; then
-            RAW_DTB=$(find "$GITHUB_WORKSPACE/dtb" -type f | head -n 1)
-          else
-            echo "Error: File atau folder 'dtb' tidak ditemukan di repository!"
-            exit 1
-          fi
-
-          echo "Found Raw DTB: $RAW_DTB"
-
-          # 3. Ekstrak FDT murni TANPA di-recompile dtc (agar node /__symbols__ untuk DTBO overlay tidak rusak!)
-          python3 -c "import sys, struct; d = open(sys.argv[1], 'rb').read(); i = d.index(b'\xd0\x0d\xfe\xed'); s = struct.unpack_from('>I', d, i+4)[0]; print(f'FDT offset: {i}, size: {s}'); open(sys.argv[2], 'wb').write(d[i:i+s])" "$RAW_DTB" "$PWD/clean_merlinx.dtb"
-          DTB_PATH="$PWD/clean_merlinx.dtb"
-
-          # 4. Buat Dummy Ramdisk (cpio.gz) agar bootloader MediaTek (lk) tidak menolak ramdisk 0 byte
-          mkdir -p dummy_rd
-          echo "merlinx" > dummy_rd/init
-          (cd dummy_rd && find . | cpio -o -H newc | gzip -9 > "$PWD/../dummy_ramdisk.cpio.gz")
-
-          # 5. Jalankan unixnu bootimg standar dulu dengan dummy ramdisk
-          python ./unixnu bootimg -D . --uefi ../uefi-merlinx --dtb "$DTB_PATH" --ramdisk "$PWD/dummy_ramdisk.cpio.gz" -o "$PWD/boot_raw.img"
-
-          # 6. Inject os_version=12.0.0, os_patch_level=2022-09, dan cmdline asli MT6768 ke dalam boot.img!
-          python3 - "$PWD/boot_raw.img" "$PWD/boot.img" << 'EOF'
-          import sys, struct
-          raw_img, out_img = sys.argv[1], sys.argv[2]
-          data = bytearray(open(raw_img, 'rb').read())
-          
-          # Hitung os_version (12.0.0) & os_patch_level (2022-09) sesuai standar Android Boot Image Header
-          # os_version: (A << 14) | (B << 7) | C -> (12 << 14) = 196608
-          # os_patch_level: ((Y - 2000) << 4) | M -> ((22) << 4) | 9 = 361
-          os_ver_patch = (196608 << 11) | 361
-          struct.pack_into('<I', data, 44, os_ver_patch)
-          
-          # Set cmdline asli merlinx: "bootopt=64S3,32N2,64N2 buildvariant=user" (offset 64, max 512 bytes)
-          cmdline = b"bootopt=64S3,32N2,64N2 buildvariant=user"
-          data[64:64+512] = cmdline.ljust(512, b'\x00')
-          
-          open(out_img, 'wb').write(data)
-          print("Successfully patched boot.img with os_version=12.0.0, os_patch_level=2022-09, and MTK 64-bit cmdline!")
-          EOF
-
-      - name: Kumpulkan Hasil Build (boot.img, boot.json, & SILICIUM_UEFI.fd)
-        run: |
-          mkdir -p output_artifacts
-          cp UniXNU-merlinx/boot.img output_artifacts/ 2>/dev/null || true
-          cp UniXNU-merlinx/boot.json output_artifacts/ 2>/dev/null || true
-          find uefi-merlinx/Build/ -name "SILICIUM_UEFI.fd" -exec cp {} output_artifacts/ \;
-          ls -lh output_artifacts/
-          cat output_artifacts/boot.json || true
-
-      - name: Upload Boot Image Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: merlinx-uefi-bootimg
-          path: output_artifacts/*
-
-  # JOB 2: (Opsional) Build HackiOS XNU Kernel di macOS ARM64 Runner
-  build-xnu:
-    if: ${{ github.event.inputs.build_target != 'firmware_only' }}
-    runs-on: macos-14
-    steps:
-      - name: Clone HackiOS XNU Kernel
-        run: |
-          git clone --recurse-submodules https://github.com/oosexgang/hackios-xnu-kernel.git
-
-      - name: Inspect repo, README & toolchain
-        working-directory: ./hackios-xnu-kernel
-        run: |
-          echo "=== ls ==="
-          ls -la
-          echo "=== README ==="
-          head -n 100 README* 2>/dev/null || echo "(tidak ada README)"
-          echo "=== Xcode & SDK ==="
-          xcodebuild -version || true
-          xcrun --sdk iphoneos --show-sdk-path || true
-          xcrun --sdk macosx --show-sdk-path || true
-          echo "=== Tools ==="
-          which dtrace ctfconvert ctfmerge ctfdump || true
-
-      - name: Install build tools (best effort)
-        run: |
-          brew install cmake ninja pkg-config || true
-
-      - name: Shim nproc (macOS tidak punya nproc)
-        run: |
-          printf '#!/bin/sh\nsysctl -n hw.ncpu\n' | sudo tee /usr/local/bin/nproc >/dev/null
-          sudo chmod +x /usr/local/bin/nproc
-          nproc
-
-      - name: Build XNU Kernel
-        working-directory: ./hackios-xnu-kernel
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          # Repo ini pakai Makefile: "make kernel" = xnu/apply.sh + xnu-deps/setup.sh + xnu-build.sh
-          make kernel JOBS=$(sysctl -n hw.ncpu) 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
-
-      - name: Cari hasil kernel
-        if: always()
-        run: |
-          find hackios-xnu-kernel -type f \
-            \( -name "kernel*" -o -name "*.kc" -o -name "kernelcache*" -o -name "*.kext" \) \
-            -not -path "*/.git/*" -not -name "*.c" -not -name "*.h" -not -name "*.s" \
-            | tee xnu-found.txt || true
-          echo "=== 50 baris terakhir log ==="
-          tail -n 50 xnu-build.log 2>/dev/null || true
-
-      - name: Upload XNU Kernel Artifact & Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hackios-xnu-kernel-bin
-          path: |
-            xnu-build.log
-            xnu-found.txt
-            hackios-xnu-kernel/xnu-src/BUILD/obj/**/kernel*
-            hackios-xnu-kernel/xnu-src/BUILD/obj/**/*.dSYM/**
-            hackios-xnu-kernel/BUILD/**
-            hackios-xnu-kernel/build/**
-          if-no-files-found: warn
+Run echo "=== ls ==="
+=== ls ===
+total 232
+drwxr-xr-x  31 runner  staff    992 Oct 28 05:03 .
+drwxr-xr-x   3 runner  staff     96 Oct 28 05:03 ..
+drwxr-xr-x  12 runner  staff    384 Oct 28 05:03 .git
+-rw-r--r--   1 runner  staff   1917 Oct 28 05:03 .gitignore
+-rw-r--r--   1 runner  staff   3570 Oct 28 05:03 COMPLIANCE.md
+-rw-r--r--   1 runner  staff   2415 Oct 28 05:03 CONTRIBUTING.md
+-rw-r--r--   1 runner  staff   3250 Oct 28 05:03 LEGAL.md
+-rw-r--r--   1 runner  staff   2059 Oct 28 05:03 LICENSE
+-rw-r--r--   1 runner  staff  19829 Oct 28 05:03 LICENSE.APSL
+-rw-r--r--   1 runner  staff   3388 Oct 28 05:03 Makefile
+-rw-r--r--   1 runner  staff   2264 Oct 28 05:03 NOTICE
+-rw-r--r--   1 runner  staff  10127 Oct 28 05:03 README.md
+-rw-r--r--   1 runner  staff   9563 Oct 28 05:03 README.uk.md
+-rw-r--r--   1 runner  staff   6321 Oct 28 05:03 README.zh.md
+-rw-r--r--   1 runner  staff   3937 Oct 28 05:03 THIRD_PARTY_LICENSES.md
+drwxr-xr-x   3 runner  staff     96 Oct 28 05:03 ci
+drwxr-xr-x   3 runner  staff     96 Oct 28 05:03 devices
+drwxr-xr-x   6 runner  staff    192 Oct 28 05:03 docs
+-rwxr-xr-x   1 runner  staff   3147 Oct 28 05:03 mkxnuimg.py
+drwxr-xr-x   6 runner  staff    192 Oct 28 05:03 prebuilt
+drwxr-xr-x  11 runner  staff    352 Oct 28 05:03 qemu
+drwxr-xr-x   6 runner  staff    192 Oct 28 05:03 sysimage
+drwxr-xr-x  39 runner  staff   1248 Oct 28 05:03 tools
+drwxr-xr-x  83 runner  staff   2656 Oct 28 05:03 userland
+drwxr-xr-x   3 runner  staff     96 Oct 28 05:03 wifi
+-rwxr-xr-x   1 runner  staff  16401 Oct 28 05:03 xl
+drwxr-xr-x   7 runner  staff    224 Oct 28 05:03 xnu
+-rwxr-xr-x   1 runner  staff   1341 Oct 28 05:03 xnu-build.sh
+drwxr-xr-x   8 runner  staff    256 Oct 28 05:03 xnu-deps
+-rw-r--r--   1 runner  staff    933 Oct 28 05:03 xnu-env.sh
+drwxr-xr-x   9 runner  staff    288 Oct 28 05:03 xnuloader
+=== README ===
+==> README.md <==
+# HakiOS
+English · [中文](README.zh.md) · [Українська](README.uk.md)
+HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with my own boot loader and my own drivers
+on an Android phone with a Qualcomm SoC, and boots the stock iOS 16.5 user space on top of it:
+launchd, backboardd, SpringBoard, the apps. The same thing runs in QEMU (`virt`, aarch64) on a
+Linux PC.
+Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system lives in RAM for
+the length of a session, and a reboot brings the phone back to its own Android. This is a research
+bench, not a ROM.
+The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The kernel knows nothing
+about it in advance: every address, interrupt, power rail and firmware comes from the phone's own
+device tree and its own Android, so a port to another Qualcomm phone is a new directory under
+`devices/`, not a rewrite.
+## What is in the repository
+Only my code and my data:
+- the kernel: a patch to Apple's open-source XNU (`xnu/hakios.patch`, APSL 2.0) and my driver
+  files (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
+- the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
+  build and run scripts;
+- `prebuilt/`: the kernel, loader and libraries built from this repository;
+- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
+Not in the repository, never:
+- any file of iOS: no binary, image, cache, font, picture or screenshot. You build the system
+  image on your machine from the iOS 16.5 IPSW, which `sysimage/fetch.sh` downloads from Apple's
+  public servers for you, without decrypting or circumventing anything;
+- the phone's firmware (GPU, Wi-Fi, audio DSP, modem, haptics, cameras): it is the vendor's and
+  is pulled from your own phone into `fw-*/`, which git ignores;
+- keys, certificates, activation, or anything that would make the phone pass as an iPhone to
+  Apple's services. Signing in to an Apple account is impossible here and not a goal.
+## Status
+| Works | Not yet |
+|---|---|
+| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound, the IPA data path and `en1` are in place; registration, the data session and the status bar bars are in progress (`docs/cellular.md`) |
+| Touch screen, multitouch, power and volume buttons | Bluetooth |
+| All 8 CPU cores, the big core at 2.4 GHz | Charging under this kernel |
+| GPU rendering on Adreno (`gpu=1`, OpenGL ES through Mesa) | Metal (there is a shader compiler, no Metal) |
+| Speakers and microphone (`adsp=1 sound=4 mic=4`) | Apple account: no Secure Enclave |
+| Battery level in the UI (through the audio DSP, `adsp=1`) | |
+| Vibration (`haptic=5`) | |
+| Wi-Fi: radio, driver, network connection (`wifi=1`) | |
+| Cameras in Camera.app (`cam=5`) | |
+| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
+| Sileo, Procursus packages, SSH into the phone | |
+## Quick start in QEMU
+Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
+```sh
+git clone https://github.com/oosexgang/hakios-os.git hakios
+cd hakios
+sysimage/fetch.sh             # the iOS 16.5 IPSW from Apple's servers, the needed parts unpacked (7.4 GB)
+REST=1 userland/build.sh      # the APFS images: userland/root.apfs and userland/system.apfs
+mkdir -p logs
+qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # a 20-minute session
+```
+The lock screen appears after two or three minutes. The mouse with the button held is a finger;
+`H` is Home, `L` is the power button, `↑`/`↓` are volume.
+## On the phone
+A phone with a port (`devices/poco-x5-pro/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
+`fastboot` on the PC, the images from the previous section, and the phone's own firmware:
+```sh
+devices/poco-x5-pro/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
+./xl enter                          # Android -> fastboot -> our loader in RAM
+./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (~80 s), once per loader session
+XL_SB_DELAY=8 XL_SECS=600 \
+XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1" \
+./xl run                            # a 10-minute session, the log goes to logs/
+./xl reboot                         # back to Android
+```
+`tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
+The main kernel arguments (the full list is in `docs/ru/notes.md`):
+| Argument | What it does |
+|---|---|
+| `cpus=8 bootcpu=7 cpufreq=1` | all CPU cores and their clocks |
+| `touchscreen=1` | the touch screen |
+| `gpu=1` | rendering on Adreno (an image built with `GL=1`, firmware in `fw-gpu/`) |
+| `adsp=1 sound=4 mic=4` | the audio DSP: speakers, microphone; battery and charging come with it |
+| `haptic=5` | the vibration motor |
+| `wifi=1` | Wi-Fi (the network from `fw-wifi/network`) |
+| `cam=5` | the cameras |
+| `modem=1` | the modem beside the system: its firmware, file systems, IPA, SIM, NAS |
+==> README.uk.md <==
+# HakiOS
+[English](README.md) · [中文](README.zh.md) · Українська
+HakiOS запускає відкрите ядро XNU (xnu-8796.121.2) з власним завантажувачем і власними драйверами
+на Android-телефоні з процесором Qualcomm, а поверх нього — стандартний користувацький простір
+iOS 16.5: launchd, backboardd, SpringBoard, застосунки. Те саме працює в QEMU (`virt`, aarch64)
+на звичайному комп'ютері з Linux.
+Нічого не прошивається. Завантажувач іде в ОЗП через `fastboot boot`, система живе в ОЗП до кінця
+сеансу, а перезавантаження повертає телефон у його власний Android. Це дослідницький стенд, а не
+прошивка.
+Перший телефон — **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). Ядро нічого не знає про нього
+наперед: кожна адреса, переривання, лінія живлення і прошивка беруться з дерева пристроїв самого
+телефона та його Android, тож порт на інший телефон Qualcomm — це новий каталог у `devices/`, а
+не переписування.
+## Що є в репозиторії
+Лише мій код і мої дані:
+- ядро: патч до відкритого XNU від Apple (`xnu/hakios.patch`, APSL 2.0) і мої файли драйверів
+  (`xnu/files/`), які `xnu/apply.sh` накладає на свіжий клон;
+- завантажувач (`xnuloader/`), мої програми й бібліотеки (`userland/src/`), інструменти
+  (`tools/`), скрипти збірки та запуску;
+- `prebuilt/`: ядро, завантажувач і бібліотеки, зібрані з цього репозиторію;
+- `devices/poco-x5-pro/`: те, що потрібно одному телефону (порт UEFI, дерево пристроїв, скрипт прошивок).
+Чого немає і не буде:
+- жодного файлу iOS: ні бінарників, ні образів, ні кешів, ні шрифтів, ні картинок, ні знімків
+  екрана. Образ системи ви збираєте на своїй машині з IPSW iOS 16.5, який `sysimage/fetch.sh`
+  завантажує з публічних серверів Apple, нічого не розшифровуючи й не обходячи;
+- прошивок телефона (GPU, Wi-Fi, аудіо-DSP, модем, вібро, камери): вони вендорські і знімаються
+  з вашого власного телефона в `fw-*/`, які git ігнорує;
+- ключів, сертифікатів, активації чи будь-чого, що видавало б телефон за iPhone перед службами
+  Apple. Вхід в обліковий запис Apple тут неможливий і не є метою.
+## Стан
+| Працює | Ще ні |
+|---|---|
+| Екран блокування, домашній екран, Пункт керування, жести, стандартні застосунки | Стільниковий зв'язок: модем стартує, бачить мережу, SIM прив'язана; реєстрація та палички в статус-барі — у роботі (`docs/cellular.md`) |
+| Сенсорний екран, мультитач, кнопки живлення та гучності | Bluetooth |
+| Усі 8 ядер процесора, велике ядро на 2,4 ГГц | Заряджання під цим ядром |
+| Графіка на Adreno (`gpu=1`, OpenGL ES через Mesa) | Metal (є компілятор шейдерів, самого Metal немає) |
+| Динаміки й мікрофон (`adsp=1 sound=4 mic=4`) | Обліковий запис Apple: немає Secure Enclave |
+| Рівень батареї в інтерфейсі (через аудіо-DSP, `adsp=1`) | |
+| Вібрація (`haptic=5`) | |
+| Wi-Fi: радіо, драйвер, підключення до мережі (`wifi=1`) | |
+| Камери в Camera.app (`cam=5`) | |
+| `/private/var` зберігається між перезавантаженнями (`var_store=1 ufs_write=1`) | |
+| Sileo, пакети Procursus, SSH на телефон | |
+## Швидкий старт у QEMU
+Linux x86-64, близько 12 ГБ на диску, 7-Zip 23 або новіший, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
+```sh
+git clone https://github.com/oosexgang/hakios-os.git hakios
+cd hakios
+make fetch        # IPSW iOS 16.5 із серверів Apple, потрібне розпаковується (7,4 ГБ)
+make images       # образи APFS: userland/root.apfs і userland/system.apfs
+make qemu         # сеанс на 20 хвилин
+```
+Екран блокування з'являється за дві-три хвилини. Миша з затиснутою кнопкою — палець; `H` —
+«Додому», `L` — кнопка живлення, `↑`/`↓` — гучність.
+## На телефоні
+Телефон, для якого є порт (`devices/poco-x5-pro/`, POCO X5 Pro 5G), з розблокованим завантажувачем,
+`adb` і `fastboot` на комп'ютері, образи з попереднього розділу і прошивки самого телефона:
+```sh
+make firmware                       # GPU, Wi-Fi, звук/батарея, вібро, модем, камери -> fw-*/
+make phone                          # 10-хвилинний сеанс з усім залізом, потім назад в Android
+make phone ARGS="modem=1" SECS=300  # або свій набір параметрів ядра
+```
+Головні параметри ядра (повний список — у `docs/ru/notes.md`):
+| Параметр | Що дає |
+|---|---|
+| `cpus=8 bootcpu=7 cpufreq=1` | усі ядра процесора та їхні частоти |
+| `touchscreen=1` | сенсорний екран |
+| `gpu=1` | малювання на Adreno (образ, зібраний з `GL=1`, прошивки у `fw-gpu/`) |
+| `adsp=1 sound=4 mic=4` | аудіо-DSP: динаміки, мікрофон; з ним же батарея та заряджання |
+| `haptic=5` | вібромотор |
+| `wifi=1` | Wi-Fi (мережа з `fw-wifi/network`) |
+| `cam=5` | камери |
+| `modem=1` | модем поруч із системою: його прошивка, файлові системи, IPA, SIM, NAS |
+| `var_store=1 ufs_write=1` | зберігати `/private/var` між перезавантаженнями |
+## Збірка з вихідників
+```sh
+make kernel       # XNU з GitHub Apple + мої зміни -> xnu-src/, залежності, збірка
+make loader       # завантажувач; identity.h робиться при збірці з вашого IPSW
+==> README.zh.md <==
+# HakiOS
+[English](README.md) · 中文 · [Українська](README.uk.md)
+HakiOS 在搭载高通 SoC 的 Android 手机上运行开源的 XNU 内核（xnu-8796.121.2），配上我自己写的引导
+程序和驱动，并在其上启动原版 iOS 16.5 用户空间：launchd、backboardd、SpringBoard 和各个应用。同样
+的东西也能在 Linux 电脑上的 QEMU（`virt`，aarch64）里运行。
+不刷写任何东西。引导程序通过 `fastboot boot` 进入内存，系统在内存里运行一个会话，重启后手机回到
+它自己的 Android。这是一个研究用的试验台，不是 ROM。
+第一台手机是 **POCO X5 Pro 5G**（`redwood`，骁龙 778G）。内核事先对它一无所知：每个地址、中断、
+电源轨和固件都来自手机自己的设备树和它的 Android，所以移植到另一台高通手机意味着在 `devices/`
+下新建一个目录，而不是重写。
+## 仓库里有什么
+只有我的代码和我的数据：
+- 内核：对 Apple 开源 XNU 的补丁（`xnu/hakios.patch`，APSL 2.0）和我的驱动文件（`xnu/files/`），
+  由 `xnu/apply.sh` 叠加到一份新克隆上；
+- 引导程序（`xnuloader/`）、我的程序和库（`userland/src/`）、工具（`tools/`）、构建和运行脚本；
+- `prebuilt/`：用本仓库构建出的内核、引导程序和库；
+- `devices/poco-x5-pro/`：一台手机所需的东西（UEFI 移植、设备树、固件脚本）。
+永远不会有的东西：
+- 任何 iOS 文件：没有二进制、镜像、缓存、字体、图片或截图。系统镜像由你在自己机器上用 iOS 16.5
+  的 IPSW 构建，`sysimage/fetch.sh` 从 Apple 的公开服务器为你下载它，不解密、不绕过任何东西；
+- 手机的固件（GPU、Wi-Fi、音频 DSP、调制解调器、振动、摄像头）：属于厂商，从你自己的手机取到
+  `fw-*/`，git 忽略这些目录；
+- 密钥、证书、激活，或任何让手机在 Apple 服务面前冒充 iPhone 的东西。这里无法登录 Apple 账户，
+  这也不是目标。
+## 现状
+| 可用 | 尚未 |
+|---|---|
+| 锁屏、主屏、控制中心、手势、系统自带应用 | 蜂窝网络：调制解调器已启动、能看到网络、SIM 已绑定；注册和状态栏信号格正在进行（`docs/cellular.md`） |
+| 触摸屏、多点触控、电源和音量键 | 蓝牙 |
+| 全部 8 个 CPU 核心，大核 2.4 GHz | 本内核下的充电 |
+| Adreno GPU 渲染（`gpu=1`，经 Mesa 的 OpenGL ES） | Metal（有着色器编译器，没有 Metal） |
+| 扬声器和麦克风（`adsp=1 sound=4 mic=4`） | Apple 账户：没有 Secure Enclave |
+| 界面里的电池电量（经音频 DSP，`adsp=1`） | |
+| 振动（`haptic=5`） | |
+| Wi-Fi：射频、驱动、联网（`wifi=1`） | |
+| 相机应用里的摄像头（`cam=5`） | |
+| `/private/var` 跨重启保留（`var_store=1 ufs_write=1`） | |
+| Sileo、Procursus 软件包、SSH 登录手机 | |
+## QEMU 快速开始
+Linux x86-64，约 12 GB 磁盘，7-Zip 23 或更新，`lz4`，`qemu-system-aarch64`，`edk2-aarch64`。
+```sh
+git clone https://github.com/oosexgang/hakios-os.git hakios
+cd hakios
+make fetch        # 从 Apple 服务器取 iOS 16.5 IPSW，解包所需部分（7.4 GB）
+make images       # APFS 镜像：userland/root.apfs 和 userland/system.apfs
+make qemu         # 20 分钟的会话
+```
+两三分钟后出现锁屏。按住鼠标键就是手指；`H` 是主屏键，`L` 是电源键，`↑`/`↓` 是音量。
+## 在手机上
+一台有移植的手机（`devices/poco-x5-pro/`，POCO X5 Pro 5G），已解锁引导程序，电脑上有 `adb` 和
+`fastboot`，上一节的镜像，以及手机自己的固件：
+```sh
+make firmware                       # GPU、Wi-Fi、音频/电池、振动、调制解调器、摄像头 -> fw-*/
+make phone                          # 10 分钟会话，全部硬件开启，然后回到 Android
+make phone ARGS="modem=1" SECS=300  # 或自定义内核参数
+```
+主要内核参数（完整列表见 `docs/ru/notes.md`）：
+| 参数 | 作用 |
+|---|---|
+| `cpus=8 bootcpu=7 cpufreq=1` | 全部 CPU 核心及其频率 |
+| `touchscreen=1` | 触摸屏 |
+| `gpu=1` | Adreno 渲染（镜像需以 `GL=1` 构建，固件在 `fw-gpu/`） |
+| `adsp=1 sound=4 mic=4` | 音频 DSP：扬声器、麦克风；电池与充电也经由它 |
+| `haptic=5` | 振动马达 |
+| `wifi=1` | Wi-Fi（网络来自 `fw-wifi/network`） |
+| `cam=5` | 摄像头 |
+| `modem=1` | 与系统并行启动调制解调器：固件、文件系统、IPA、SIM、NAS |
+| `var_store=1 ufs_write=1` | 跨重启保留 `/private/var` |
+## 从源码构建
+```sh
+make kernel       # 从 Apple 的 GitHub 取 XNU 源码 + 我的修改 -> xnu-src/，依赖，构建
+make loader       # 引导程序；identity.h 在构建时由你的 IPSW 生成
+make images       # 用户空间和镜像
+```
+详情见 `xnu/README.md` 和 `docs/ru/notes.md`。
+## 目录结构
+=== Xcode & SDK ===
+Xcode 15.4
+Build version 15F31d
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk
+=== Tools ===
+/usr/sbin/dtrace
+2s
+Run brew install cmake ninja pkg-config || true
+Warning: cmake 4.4.3 is already installed and up-to-date.
+To reinstall 4.4.3, run:
+  brew reinstall cmake
+Warning: ninja 1.13.2 is already installed and up-to-date.
+To reinstall 1.13.2, run:
+  brew reinstall ninja
+Warning: pkgconf 3.0.6 is already installed and up-to-date.
+To reinstall 3.0.6, run:
+  brew reinstall pkgconf
+0s
+Run printf '#!/bin/sh\nsysctl -n hw.ncpu\n' | sudo tee /usr/local/bin/nproc >/dev/null
+3
+15s
+Run set -o pipefail
+[ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh
+apply.sh: /Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2: xnu-8796.121.2 + 73 changed and      110 new files
+[ -x xnu-deps/host/bin/xnu-clang ] || xnu-deps/setup.sh
+./xnu-build.sh -j3 -k
+             CC externs.o
+       GENERATE kasan-blacklist-x86_64
+       GENERATE bsd/sys/_posix_availability.h
+       GENERATE kasan-blacklist-arm64
+       GENERATE bsd/sys/_symbol_aliasing.h
+Unable to locate /Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-deps/sdk/iPhoneOS16.5.xnu.sdk//usr/local/libexec/availability.pl (or not executable)
+make[6]: *** [_symbol_aliasing.h] Error 1
+make[6]: Target `do_build_setup' not remade because of errors.
+make[5]: *** [build_setup] Error 2
+make[4]: *** [build_setup_recurse_into_sys] Error 2
+make[4]: Target `build_setup' not remade because of errors.
+make[3]: *** [build_setup_recurse_into_bsd] Error 2
+             CC kextsymboltool.o
+       GENERATE kcov-blacklist-x86_64
+       GENERATE kcov-blacklist-arm64
+          BISON parser.c
+             CC openp.o
+             CC searchp.o
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:465:14: warning: 'NXArchInfo' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+static const NXArchInfo *
+             ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/arch.h:58:27: note: 'NXArchInfo' has been explicitly marked deprecated here
+typedef struct NXArchInfo NXArchInfo __CCTOOLS_DEPRECATED;
+                          ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:472:15: warning: 'NXArchInfo' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+        static const NXArchInfo archlist[] = {
+                     ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/arch.h:58:27: note: 'NXArchInfo' has been explicitly marked deprecated here
+typedef struct NXArchInfo NXArchInfo __CCTOOLS_DEPRECATED;
+                          ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:508:8: warning: 'NXArchInfo' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+        const NXArchInfo *  host_arch;
+              ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/arch.h:58:27: note: 'NXArchInfo' has been explicitly marked deprecated here
+typedef struct NXArchInfo NXArchInfo __CCTOOLS_DEPRECATED;
+                          ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:509:8: warning: 'NXArchInfo' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+        const NXArchInfo *  target_arch;
+              ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/arch.h:58:27: note: 'NXArchInfo' has been explicitly marked deprecated here
+typedef struct NXArchInfo NXArchInfo __CCTOOLS_DEPRECATED;
+                          ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:523:14: warning: 'NXGetLocalArchInfo' is deprecated: first deprecated in macOS 13.0 [-Wdeprecated-declarations]
+        host_arch = NXGetLocalArchInfo();
+                    ^~~~~~~~~~~~~~~~~~
+                    use macho_arch_name_for_mach_header()
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/arch.h:72:26: note: 'NXGetLocalArchInfo' has been explicitly marked deprecated here
+extern const NXArchInfo *NXGetLocalArchInfo(void) __CCTOOLS_DEPRECATED_MSG("use macho_arch_name_for_mach_header()");
+                         ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:763:4: warning: 'swap_mach_header_64' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                        swap_mach_header_64(&hdr, target_arch->byteorder);
+                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:63:13: note: 'swap_mach_header_64' has been explicitly marked deprecated here
+extern void swap_mach_header_64(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:764:4: warning: 'swap_segment_command_64' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                        swap_segment_command_64(&segcmd, target_arch->byteorder);
+                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:75:13: note: 'swap_segment_command_64' has been explicitly marked deprecated here
+extern void swap_segment_command_64(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:801:4: warning: 'swap_mach_header' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                        swap_mach_header(&hdr, target_arch->byteorder);
+                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:59:13: note: 'swap_mach_header' has been explicitly marked deprecated here
+extern void swap_mach_header(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:802:4: warning: 'swap_segment_command' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                        swap_segment_command(&segcmd, target_arch->byteorder);
+                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:71:13: note: 'swap_segment_command' has been explicitly marked deprecated here
+extern void swap_segment_command(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:816:3: warning: 'swap_symtab_command' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                swap_symtab_command(&symcmd, target_arch->byteorder);
+                ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:89:13: note: 'swap_symtab_command' has been explicitly marked deprecated here
+extern void swap_symtab_command(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:817:3: warning: 'swap_uuid_command' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                swap_uuid_command(&uuidcmd, target_arch->byteorder);
+                ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:217:13: note: 'swap_uuid_command' has been explicitly marked deprecated here
+extern void swap_uuid_command(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:877:6: warning: 'swap_nlist_64' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                                        swap_nlist_64(&nl, 1, target_arch->byteorder);
+                                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:235:13: note: 'swap_nlist_64' has been explicitly marked deprecated here
+extern void swap_nlist_64(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:903:6: warning: 'swap_nlist' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                                        swap_nlist(&nl, 1, target_arch->byteorder);
+                                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:230:13: note: 'swap_nlist' has been explicitly marked deprecated here
+extern void swap_nlist(
+            ^
+13 warnings generated.
+             LD kextsymboltool
+             CC setsegname.o
+             LD setsegname
+       CODESIGN setsegname
+       CODESIGN kextsymboltool
+             CC main.o
+             CC installfile.o
+             CC decomment.o
+             CC mkheaders.o
+             LD installfile
+             LD decomment
+       CODESIGN installfile
+             CC mkioconf.o
+       CODESIGN decomment
+             CC mkmakefile.o
+             CC replacecontents.o
+           FLEX lexer.yy.c
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/config/mkmakefile.c:625:6: warning: variable 'lpos' set but not used [-Wunused-but-set-variable]
+        int lpos, len = 0; /* dvw: init to 0 */
+            ^
+1 warning generated.
+             CC parser.o
+             LD replacecontents
+       CODESIGN replacecontents
+             CC lexer.yy.o
+             LD config
+       CODESIGN config
+make[3]: Target `build_setup' not remade because of errors.
+make[2]: *** [build_setup_bootstrap_DEVELOPMENT^ARM64^BCM2837] Error 2
+make[2]: Target `all' not remade because of errors.
+make[1]: *** [all] Error 2
+make[1]: Target `default' not remade because of errors.
+make: *** [kernel] Error 2
+Error: Process completed with exit code 2.
+0s
+Run find hackios-xnu-kernel -type f \
+hackios-xnu-kernel/xnu-src/xnu-8796.121.2/tools/lldbmacros/core/kernelcore.py
+hackios-xnu-kernel/xnu-src/xnu-8796.121.2/tests/kernel_symbolication_entitlements.plist
+hackios-xnu-kernel/xnu-src/xnu-8796.121.2/osfmk/man/kernel_resource_sizes.html
+hackios-xnu-kernel/tools/kernel-delta.sh
+hackios-xnu-kernel/tools/air/kernelcheck.py
+=== 50 baris terakhir log ===
+                ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:217:13: note: 'swap_uuid_command' has been explicitly marked deprecated here
+extern void swap_uuid_command(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:877:6: warning: 'swap_nlist_64' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                                        swap_nlist_64(&nl, 1, target_arch->byteorder);
+                                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:235:13: note: 'swap_nlist_64' has been explicitly marked deprecated here
+extern void swap_nlist_64(
+            ^
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/kextsymboltool/kextsymboltool.c:903:6: warning: 'swap_nlist' is deprecated: first deprecated in macOS 13.0 - No longer supported [-Wdeprecated-declarations]
+                                        swap_nlist(&nl, 1, target_arch->byteorder);
+                                        ^
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.5.sdk/usr/include/mach-o/swap.h:230:13: note: 'swap_nlist' has been explicitly marked deprecated here
+extern void swap_nlist(
+            ^
+13 warnings generated.
+             LD kextsymboltool
+             CC setsegname.o
+             LD setsegname
+       CODESIGN setsegname
+       CODESIGN kextsymboltool
+             CC main.o
+             CC installfile.o
+             CC decomment.o
+             CC mkheaders.o
+             LD installfile
+             LD decomment
+       CODESIGN installfile
+             CC mkioconf.o
+       CODESIGN decomment
+             CC mkmakefile.o
+             CC replacecontents.o
+           FLEX lexer.yy.c
+/Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder/hackios-xnu-kernel/xnu-src/xnu-8796.121.2/SETUP/config/mkmakefile.c:625:6: warning: variable 'lpos' set but not used [-Wunused-but-set-variable]
+        int lpos, len = 0; /* dvw: init to 0 */
+            ^
+1 warning generated.
+             CC parser.o
+             LD replacecontents
+       CODESIGN replacecontents
+             CC lexer.yy.o
+             LD config
+       CODESIGN config
+make[3]: Target `build_setup' not remade because of errors.
+make[2]: *** [build_setup_bootstrap_DEVELOPMENT^ARM64^BCM2837] Error 2
+make[2]: Target `all' not remade because of errors.
+make[1]: *** [all] Error 2
+make[1]: Target `default' not remade because of errors.
+make: *** [kernel] Error 2
+2s
+Run actions/upload-artifact@v4
+(node:2889) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Multiple search paths detected. Calculating the least common ancestor of all paths
+The least common ancestor is /Users/runner/work/merlinx-hackios-builder/merlinx-hackios-builder. This will be the root directory of the artifact
+With the provided path, there will be 2 files uploaded
+Artifact name is valid!
+Root directory input is valid!
+Beginning upload of artifact content to blob storage
+(node:2889) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+Uploaded bytes 1921
+Finished uploading artifact content to blob storage!
+SHA256 digest of uploaded artifact zip is 229534aee16d6de8717498f8f30dd5fe71d3eb3492bfa16b1ac18498a38bbe1f
+Finalizing artifact upload
+Artifact hackios-xnu-kernel-bin.zip successfully finalized. Artifact ID 12792993924
+Artifact hackios-xnu-kernel-bin has been successfully uploaded! Final size is 1921 bytes. Artifact ID is 12792993924
+Artifact download URL: https://github.com/KevinSuharjo/merlinx-hackios-builder/actions/runs/40635751025/artifacts/12792993924
+1s
+Warning: Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
