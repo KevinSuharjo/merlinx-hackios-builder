@@ -73,22 +73,8 @@ jobs:
 
           echo "Found Raw DTB: $RAW_DTB"
 
-          # 3. Ekstrak & Bersihkan FDT murni (hapus MTK header / concatenated DTB / padding)
-          cat << 'EOF' > fix_dtb.py
-          import sys, struct
-          raw_path, out_path = sys.argv[1], sys.argv[2]
-          data = open(raw_path, 'rb').read()
-          magic = b'\xd0\x0d\xfe\xed'
-          idx = data.find(magic)
-          if idx == -1:
-              sys.exit(f"Error: Magic FDT (d00dfeed) tidak ditemukan di {raw_path}! Pastikan file tidak corrupt.")
-          total_size = struct.unpack_from('>I', data, idx + 4)[0]
-          print(f"FDT ditemukan pada offset {idx}, ukuran murni: {total_size} bytes (ukuran file asli: {len(data)} bytes)")
-          fdt = data[idx : idx + total_size]
-          open(out_path, 'wb').write(fdt)
-          EOF
-          sed -i 's/^[ \t]*//' fix_dtb.py
-          python3 fix_dtb.py "$RAW_DTB" "$PWD/clean_merlinx.dtb"
+          # 3. Ekstrak & Bersihkan FDT murni (1 baris Python tanpa masalah indentasi YAML)
+          python3 -c "import sys, struct; d = open(sys.argv[1], 'rb').read(); i = d.index(b'\xd0\x0d\xfe\xed'); s = struct.unpack_from('>I', d, i+4)[0]; print(f'FDT offset: {i}, size: {s}'); open(sys.argv[2], 'wb').write(d[i:i+s])" "$RAW_DTB" "$PWD/clean_merlinx.dtb"
 
           # Normalisasi ulang lewat dtc (kalau gagal pakai hasil potong langsung)
           dtc -I dtb -O dtb -o "$PWD/merlinx_final.dtb" "$PWD/clean_merlinx.dtb" || cp "$PWD/clean_merlinx.dtb" "$PWD/merlinx_final.dtb"
