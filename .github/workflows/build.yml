@@ -152,12 +152,8 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          if [ -f "build.sh" ]; then
-            chmod +x build.sh
-            ./build.sh 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
-          else
-            make SDKROOT=iphoneos ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT -j$(sysctl -n hw.ncpu) 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
-          fi
+          # Repo ini pakai Makefile: "make kernel" = xnu/apply.sh + xnu-deps/setup.sh + xnu-build.sh
+          make kernel JOBS=$(sysctl -n hw.ncpu) 2>&1 | tee "$GITHUB_WORKSPACE/xnu-build.log"
 
       - name: Cari hasil kernel
         if: always()
@@ -177,6 +173,8 @@ jobs:
           path: |
             xnu-build.log
             xnu-found.txt
+            hackios-xnu-kernel/xnu-src/BUILD/obj/**/kernel*
+            hackios-xnu-kernel/xnu-src/BUILD/obj/**/*.dSYM/**
             hackios-xnu-kernel/BUILD/**
             hackios-xnu-kernel/build/**
           if-no-files-found: warn
